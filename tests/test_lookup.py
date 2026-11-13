@@ -7,6 +7,7 @@ import asyncio
 import json
 import logging
 import sys
+import threading
 
 import pytest
 
@@ -195,3 +196,114 @@ def test_response_size_limit_is_enforced(monkeypatch):
     monkeypatch.setattr(client, "urlopen", lambda *args, **kwargs: Response())
     with pytest.raises(ValueError, match="size limit"):
         client._get_json(207195, "lite")
+
+
+@pytest.mark.parametrize("slow_kind", ["title", "work"])
+@pytest.mark.parametrize("fast_kind", ["title", "work"])
+def test_unrelated_queries_do_not_wait_for_a_slow_request(monkeypatch, slow_kind, fast_kind):
+    started, release = threading.Event(), threading.Event()
+
+    def search(keyword, subject_type, limit):
+        if keyword == "slow":
+            started.set()
+            assert release.wait(5)
+        return [{"id": 207195, "name_cn": keyword}]
+
+    def get_json(subject_id, resource):
+        if subject_id == 1:
+            started.set()
+            assert release.wait(5)
+        return {"id": subject_id, "title": str(subject_id)} if resource == "lite" else []
+
+    monkeypatch.setattr(client, "_search_subjects", search)
+    monkeypatch.setattr(client, "_get_json", get_json)
+
+    async def scenario():
+        value = client.AniTabiClient()
+        slow = asyncio.create_task(value.lookup_subjects("slow") if slow_kind == "title" else value._work(1))
+        fast = None
+        try:
+            assert await asyncio.to_thread(started.wait, 1)
+            fast = asyncio.create_task(value.lookup_subjects("fast") if fast_kind == "title" else value._work(2))
+            result = await asyncio.wait_for(asyncio.shield(fast), timeout=1)
+            assert result
+            assert not slow.done()
+        finally:
+            release.set()
+            await asyncio.gather(slow, *([fast] if fast is not None else []), return_exceptions=True)
+
+    asyncio.run(scenario())
+
+
+def test_same_work_is_loaded_once_when_a_waiting_caller_is_cancelled(monkeypatch):
+    started, release = threading.Event(), threading.Event()
+    calls = []
+
+    def get_json(subject_id, resource):
+        calls.append((subject_id, resource))
+        started.set()
+        assert release.wait(5)
+        return {"id": subject_id, "title": "work"} if resource == "lite" else []
+
+    monkeypatch.setattr(client, "_get_json", get_json)
+
+    async def scenario():
+        value = client.AniTabiClient()
+        first = asyncio.create_task(value._work(207195))
+        second = third = None
+        try:
+            assert await asyncio.to_thread(started.wait, 1)
+            second = asyncio.create_task(value._work(207195))
+            third = asyncio.create_task(value._work(207195))
+            await asyncio.sleep(0)
+            second.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await second
+            release.set()
+            a, b = await asyncio.gather(first, third)
+            assert a == b
+            assert await value._work(207195) == a
+            assert sorted(calls) == [(207195, "lite"), (207195, "points/detail")]
+        finally:
+            release.set()
+            await asyncio.gather(first, *[t for t in (second, third) if t is not None], return_exceptions=True)
+
+    asyncio.run(scenario())
+
+
+def test_landmark_probes_share_the_network_concurrency_limit(monkeypatch):
+    release, first_wave = threading.Event(), threading.Event()
+    lock = threading.Lock()
+    active = peak = 0
+
+    def get_json(subject_id, resource):
+        nonlocal active, peak
+        with lock:
+            active += 1
+            peak = max(peak, active)
+            if active >= 4:
+                first_wave.set()
+        try:
+            assert release.wait(5)
+            return {"id": subject_id, "pointsLength": 0}
+        finally:
+            with lock:
+                active -= 1
+
+    monkeypatch.setattr(client, "_get_json", get_json)
+
+    async def scenario():
+        value = client.AniTabiClient()
+        pending = [asyncio.create_task(value.has_landmarks(subject_id)) for subject_id in range(1, 11)]
+        try:
+            assert await asyncio.to_thread(first_wave.wait, 1)
+            await asyncio.sleep(0.05)
+            assert peak == 4
+            release.set()
+            assert await asyncio.gather(*pending) == [False] * 10
+            assert peak == 4
+        finally:
+            release.set()
+            await asyncio.gather(*pending, return_exceptions=True)
+
+    asyncio.run(scenario())

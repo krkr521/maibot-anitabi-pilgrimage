@@ -1,8 +1,10 @@
 """Read AniTabi's public work and landmark data."""
 
 from collections import OrderedDict
+from contextlib import asynccontextmanager
+from dataclasses import dataclass, field
 from time import monotonic
-from typing import Any, Dict, List
+from typing import Any, AsyncIterator, Dict, List, Tuple
 from unicodedata import normalize
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
@@ -16,6 +18,7 @@ MAP_ROOT = "https://anitabi.cn/map"
 CACHE_SECONDS = 15 * 60
 MAX_CACHED_WORKS = 24
 MAX_RESPONSE_BYTES = 2 * 1024 * 1024
+MAX_CONCURRENT_REQUESTS = 4
 
 _POINT_ID = re.compile(r"[a-zA-Z0-9_-]{1,48}")
 _NAME_VARIANTS = str.maketrans({"站": "駅", "车": "車", "臺": "台", "\u200b": None})
@@ -71,10 +74,10 @@ def _search_subjects(keyword: str, subject_type: str, limit: int) -> List[Dict[s
         if type(kind) is not int or kind not in _SUBJECT_TYPE_NAMES:
             continue
         aliases = []
-        for field in item.get("infobox", []) if isinstance(item.get("infobox"), list) else []:
-            if not isinstance(field, dict) or field.get("key") != "别名":
+        for info_field in item.get("infobox", []) if isinstance(item.get("infobox"), list) else []:
+            if not isinstance(info_field, dict) or info_field.get("key") != "别名":
                 continue
-            values = field.get("value")
+            values = info_field.get("value")
             if isinstance(values, str):
                 aliases.append(_text(values))
             elif isinstance(values, list):
@@ -144,21 +147,48 @@ def _work_data(subject_id: int, overview: Any, points: Any) -> Dict[str, Any]:
     }
 
 
+@dataclass
+class _LookupLock:
+    lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    users: int = 0
+
+
 class AniTabiClient:
     def __init__(self) -> None:
         self._cache: OrderedDict[int, tuple[float, Dict[str, Any]]] = OrderedDict()
         self._subject_cache: OrderedDict[tuple[str, str, int], tuple[float, List[Dict[str, Any]]]] = OrderedDict()
-        self._lock = asyncio.Lock()
+        self._lookup_locks: Dict[Tuple[Any, ...], _LookupLock] = {}
+        self._network_slots = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
+
+    @asynccontextmanager
+    async def _key_lock(self, key: Tuple[Any, ...]) -> AsyncIterator[None]:
+        entry = self._lookup_locks.get(key)
+        if entry is None:
+            entry = _LookupLock()
+            self._lookup_locks[key] = entry
+        entry.users += 1
+        try:
+            async with entry.lock:
+                yield
+        finally:
+            entry.users -= 1
+            if entry.users == 0:
+                del self._lookup_locks[key]
+
+    async def _fetch_json(self, subject_id: int, resource: str) -> Any:
+        async with self._network_slots:
+            return await asyncio.to_thread(_get_json, subject_id, resource)
 
     async def lookup_subjects(self, keyword: str, subject_type: str = "", limit: int = 10) -> List[Dict[str, Any]]:
         """Resolve titles through the public Bangumi API without another plugin."""
         key = (keyword, subject_type, limit)
-        async with self._lock:
+        async with self._key_lock(("title", *key)):
             cached = self._subject_cache.get(key)
             if cached and cached[0] > monotonic():
                 self._subject_cache.move_to_end(key)
                 return cached[1]
-            subjects = await asyncio.to_thread(_search_subjects, keyword, subject_type, limit)
+            async with self._network_slots:
+                subjects = await asyncio.to_thread(_search_subjects, keyword, subject_type, limit)
             self._subject_cache[key] = (monotonic() + CACHE_SECONDS, subjects)
             self._subject_cache.move_to_end(key)
             if len(self._subject_cache) > MAX_CACHED_WORKS:
@@ -166,15 +196,15 @@ class AniTabiClient:
             return subjects
 
     async def _work(self, subject_id: int) -> Dict[str, Any]:
-        # Serialize cache misses so concurrent chats don't refresh the same work repeatedly.
-        async with self._lock:
+        # Merge requests for this work while other works use their own cache locks.
+        async with self._key_lock(("work", subject_id)):
             cached = self._cache.get(subject_id)
             if cached and cached[0] > monotonic():
                 self._cache.move_to_end(subject_id)
                 return cached[1]
             overview, points = await asyncio.gather(
-                asyncio.to_thread(_get_json, subject_id, "lite"),
-                asyncio.to_thread(_get_json, subject_id, "points/detail"),
+                self._fetch_json(subject_id, "lite"),
+                self._fetch_json(subject_id, "points/detail"),
             )
             work = _work_data(subject_id, overview, points)
             self._cache[subject_id] = (monotonic() + CACHE_SECONDS, work)
@@ -189,7 +219,7 @@ class AniTabiClient:
         if cached and cached[0] > monotonic():
             return bool(cached[1]["points"])
         try:
-            overview = await asyncio.to_thread(_get_json, subject_id, "lite")
+            overview = await self._fetch_json(subject_id, "lite")
         except HTTPError as exc:
             if exc.code == 404:
                 return False
